@@ -15,6 +15,7 @@ import certifi
 import zlib
 import logging
 import requests
+from yaml import load 
 from datetime import datetime as dt
 from sqlalchemy import create_engine, ForeignKey
 from sqlalchemy import Column, Date, DateTime, Integer, String, Boolean, BigInteger, Float, Binary
@@ -23,33 +24,35 @@ from sqlalchemy.orm import relationship, backref, sessionmaker
 
 Base = declarative_base()
 
-# load the auth pickle
-keys = pickle.load(open("mykeys.p","rb"))
-
-# authenticate to the twitter api
-auth = tweepy.OAuthHandler(keys['ConsumerKey'],keys['ConsumerSecret'])
-auth.set_access_token(keys['AccessToken'],keys['AccessTokenSecret'])
-api = tweepy.API(auth)
-
-# connect to sqlite db
-dbfile='sqlite:///twitter.db'
-engine = create_engine(dbfile,echo=False)
-
 # open https pool for grabbing url data
 https = urllib3.PoolManager(cert_reqs="CERT_REQUIRED", ca_certs=certifi.where())
 
-def main():
-    FORMAT = "%(asctime)-15s %(message)s"
-    logging.basicConfig(filename='TweetDB.log', level=logging.INFO, format=FORMAT)
-    stream_to_db()
+def read_parmdata(parmfile):
+    # parse a YAML parameter file
+    with open(parmfile,'r') as f:
+        return load(f)
 
-def create_tables():
+def get_oauth(parmdata):
+    # authenticate to twitter
+    keys = pickle.load(open(parmdata['files']['twitter_keys'],'rb'))
+    auth = tweepy.OAuthHandler(keys['ConsumerKey'],keys['ConsumerSecret'])
+    auth.set_access_token(keys['AccessToken'],keys['AccessTokenSecret'])
+    return auth
+    
+def get_sqlite_engine(parmdata):
+    return create_engine('sqlite:///' + parmdata['files']['db_file'],echo=False)
+
+def create_tables(engine):
     Base.metadata.create_all(engine)
 
-def drop_tables():
-    Base.metadata.drop_all(engine)
+def drop_tables(engine):
+    dropflag = raw_input('WARNING: All tables in database will be dropped.  Proceed? [y/N] ')
+    if dropflag.upper() == 'Y':
+        Base.metadata.drop_all(engine)
 
-def read_timeline(userid=None):
+def read_timeline(engine,auth,parmdata,userid=None):
+    api = tweepy.API(auth)
+    
     try:
        # make session
        Session = sessionmaker(bind=engine)
@@ -62,7 +65,7 @@ def read_timeline(userid=None):
        # get tweets
        myCursor = tweepy.Cursor(api.user_timeline,id=userid)
        for rawtweet in myCursor.items():
-           add_tweet(rawtweet,session)
+           add_tweet(rawtweet,session,parmdata['settings']['get_images'])
 
        # commit
        session.commit()
@@ -73,7 +76,7 @@ def read_timeline(userid=None):
   
     session.close()
 
-def add_tweet(tweet,session):
+def add_tweet(tweet,session,get_images=False):
    # check if we've already added this tweet
    if session.query(Tweet).filter(Tweet.tweetid == tweet.id).count() == 0:
       tweetobj = Tweet(tweet)
@@ -99,13 +102,13 @@ def add_tweet(tweet,session):
           geotagobj = Geotag(tweet)
           session.merge(geotagobj)
           session.commit()
-      '''
-      if 'media' in tweet.entities:
+      
+      if (get_images) and ('media' in tweet.entities):
           for media in tweet.entities['media']:
               mediaobj = Media(tweet,media)
               session.merge(mediaobj)
               session.commit()
-      '''
+      
    else:
       tweetobj = session.query(Tweet).filter(Tweet.tweetid==tweet.id).one()
       tweetobj.update(tweet)
@@ -125,15 +128,19 @@ def add_user(user,session):
           session.commit()
           
 
-def stream_to_db():
-    languages = ['en','unk']
+def stream_to_db(auth,engine,parmdata):
     while True: 
        try:
           # make session
           Session = sessionmaker(bind=engine)
           session = Session()
- 
-          myListener = database_listener(session,languages)
+
+          # set up twitter api
+          api = tweepy.API(auth)
+
+          # set up strema listener
+          myListener = database_listener(session,api,parmdata)
+
           stream = tweepy.streaming.Stream(auth,myListener,timeout=60)
           stream.sample()
        except KeyboardInterrupt:
@@ -143,7 +150,10 @@ def stream_to_db():
        except requests.packages.urllib3.exceptions.ProtocolError:
           continue
        except:
-          continue
+          raise
+          #while api.wait_on_rate_limit:
+          #    time.sleep(10)
+          #continue
     session.close()     
 
 
@@ -153,7 +163,6 @@ def stream_to_db():
 class database_listener(tweepy.StreamListener):
     ''' Handles data received from the stream. '''
  
-    update_time = 10  # seconds
     n_total = 0
     n_valid = 0
     last_time = dt.now()
@@ -163,7 +172,7 @@ class database_listener(tweepy.StreamListener):
         if any(status.lang in s for s in self.languages):
             self.n_valid+=1
             add_user(status.author,self.session)
-            add_tweet(status,self.session)
+            add_tweet(status,self.session,self.get_images)
         self.status_update()
         return True
  
@@ -175,15 +184,17 @@ class database_listener(tweepy.StreamListener):
         print('Timeout...')
         return True # To continue listening
 
-    def __init__(self,session,languages):
+    def __init__(self,session,api,parmdata):
         self.session = session
         self.api = api
-        self.languages = languages
+        self.languages  = parmdata['settings']['langs']
+        self.get_images = parmdata['settings']['get_images']
+        self.update_time = parmdata['settings']['log_interval']
 
     def status_update(self):
         elapsed_time = (dt.now() - self.last_time).total_seconds()
         if elapsed_time > self.update_time:
-            logging.info("Capturing %f tweets/second (%f tweets/second after filtering, %f elapsed time)"%(self.n_total/elapsed_time,self.n_valid/elapsed_time,elapsed_time))
+            logging.info("Capturing %f tweets/second (%f tweets/second after filtering, %f sec elapsed time)"%(self.n_total/elapsed_time,self.n_valid/elapsed_time,elapsed_time))
             self.last_time = dt.now()
             self.n_total = 0
             self.n_valid = 0
