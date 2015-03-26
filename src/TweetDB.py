@@ -24,8 +24,14 @@ from sqlalchemy.orm import relationship, backref, sessionmaker
 
 Base = declarative_base()
 
+# get rootLogger
+rootLogger = logging.getLogger("root")
+
 # open https pool for grabbing url data
 https = urllib3.PoolManager(cert_reqs="CERT_REQUIRED", ca_certs=certifi.where())
+
+def test_logger(message):
+    rootLogger.info(message)
 
 def read_parmdata(parmfile):
     # parse a YAML parameter file
@@ -39,15 +45,21 @@ def get_oauth(parmdata):
     auth.set_access_token(keys['AccessToken'],keys['AccessTokenSecret'])
     return auth
     
-def get_sqlite_engine(parmdata):
-    return create_engine('sqlite:///' + parmdata['files']['db_file'],echo=False)
+def get_sql_engine(parmdata):
+    if parmdata['database']['db_type'].upper() == 'SQLITE':
+        return create_engine('sqlite:///' + parmdata['database']['db_host'],echo=False)
+    elif parmdata['database']['db_type'].upper() == 'POSTGRES':
+        dblogin = pickle.load(open(parmdata['database']['db_login'],'rb'))
+        return create_engine('postgresql://' + dblogin['username'] + ':' + dblogin['password'] + '@' + parmdata['database']['db_host'] + '/' + parmdata['database']['db_name'],echo=False)
 
 def create_tables(engine):
+    rootLogger.info('Creating database tables.')
     Base.metadata.create_all(engine)
 
 def drop_tables(engine):
     dropflag = raw_input('WARNING: All tables in database will be dropped.  Proceed? [y/N] ')
     if dropflag.upper() == 'Y':
+        rootLogger.info('Dropping database tables.')
         Base.metadata.drop_all(engine)
 
 def read_timeline(engine,auth,parmdata,userid=None):
@@ -144,8 +156,11 @@ def stream_to_db(auth,engine,parmdata):
           stream = tweepy.streaming.Stream(auth,myListener,timeout=60)
           stream.sample()
        except KeyboardInterrupt:
+          rootLogger.info('Keyboard interrupt detected.  Shutting down.')
           stream.disconnect()
-          myListener.session.close()
+          rootLogger.info('Stream disconnected.')
+          session.close()
+          rootLogger.info('Database session closed.')
           break
        except requests.packages.urllib3.exceptions.ProtocolError:
           continue
@@ -188,13 +203,16 @@ class database_listener(tweepy.StreamListener):
         self.session = session
         self.api = api
         self.languages  = parmdata['settings']['langs']
+        for lang in self.languages:
+            rootLogger.info('Logging tweets of language \'%s\'.'%lang)
         self.get_images = parmdata['settings']['get_images']
+        rootLogger.info('Logging of image file data is set to \'%s\'.'%self.get_images)
         self.update_time = parmdata['settings']['log_interval']
 
     def status_update(self):
         elapsed_time = (dt.now() - self.last_time).total_seconds()
         if elapsed_time > self.update_time:
-            logging.info("Capturing %f tweets/second (%f tweets/second after filtering, %f sec elapsed time)"%(self.n_total/elapsed_time,self.n_valid/elapsed_time,elapsed_time))
+            rootLogger.info("Capturing %f tweets/second (%f tweets/second after filtering, %f sec elapsed time)"%(self.n_total/elapsed_time,self.n_valid/elapsed_time,elapsed_time))
             self.last_time = dt.now()
             self.n_total = 0
             self.n_valid = 0
@@ -240,8 +258,8 @@ class Mention(Base):
     """User Mention Data"""
     __tablename__ = "Mention"
     tweetid = Column('tweetid',BigInteger,ForeignKey("Tweet.tweetid"),unique=False,primary_key=True)
-    source = Column('source',Integer,unique=False)
-    target = Column('target',Integer,unique=False)
+    source = Column('source',BigInteger,unique=False)
+    target = Column('target',BigInteger,unique=False)
     
     def __init__(self,tweet,mention):
         self.tweetid = tweet.id
@@ -266,8 +284,8 @@ class Tweet(Base):
     __tablename__ = "Tweet"
 
     tweetid = Column(BigInteger,primary_key=True)
-    userid = Column('userid',Integer,ForeignKey("User.userid"))
-    text = Column('text',String(length=140),nullable=True)
+    userid = Column('userid',BigInteger,ForeignKey("User.userid"))
+    text = Column('text',String(length=500),nullable=True)
     rtcount = Column('rtcount',Integer)
     fvcount = Column('fvcount',Integer)
     lang = Column('lang',String)
@@ -298,7 +316,7 @@ class User(Base):
     """Twitter User Data"""
     __tablename__ = "User"
 
-    userid = Column(Integer,primary_key=True)
+    userid = Column(BigInteger,primary_key=True)
     username = Column('username',String)
     location = Column('location',String,nullable=True)
     description = Column('description',String,nullable=True)

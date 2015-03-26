@@ -3,7 +3,7 @@
 import TweetDB.src.TweetDB as TDB
 import logging
 import argparse
-
+import sys
 
 def main():
     # command line option parsing stuff
@@ -17,8 +17,8 @@ def main():
     danger_group.add_argument("-c", "--create",
                   action="store_true", dest="createflag",default=False,
                   help="create a new set of tables")
-    parser.add_argument("-v", "--verbose",default=True,action="store_true",
-                      help="log to screen as well as logfile")
+    parser.add_argument("-v", "--verbose",default=False,action="store_true",
+                      dest="verbose",help="log to screen as well as logfile")
 
     parser.add_argument("parmfile",type=str,help = 'YAML parameter file')
 
@@ -27,9 +27,27 @@ def main():
     # parse YAML parmfile
     parmdata = TDB.read_parmdata(args.parmfile)
 
-    # spin up my engine/authentication 
+    # set up the logger
+    logFormatter = logging.Formatter("%(asctime)s [%(filename)-18s] [%(levelname)-5.5s]  %(message)s")
+    rootLogger = logging.getLogger('root')
+    rootLogger.setLevel('INFO')
+
+    fileHandler = logging.FileHandler(parmdata['files']['log_file'],mode='w')
+    fileHandler.setFormatter(logFormatter)
+    rootLogger.addHandler(fileHandler)
+ 
+    if args.verbose:
+        consoleHandler = logging.StreamHandler(sys.stdout)
+        consoleHandler.setFormatter(logFormatter)
+        rootLogger.addHandler(consoleHandler)
+
+    rootLogger.info('Starting.')
+
+    # spin up my engine/authentication
+    rootLogger.info('Authenticating to Twitter.')
     auth = TDB.get_oauth(parmdata)
-    engine = TDB.get_sqlite_engine(parmdata)
+    rootLogger.info('Connecting to database.')
+    engine = TDB.get_sql_engine(parmdata)
 
     # handle the drop/create table cases first
     if args.dropflag:
@@ -39,11 +57,7 @@ def main():
     if args.createflag:
         TDB.create_tables(engine)
         return
-
-    # set up the logger
-    #FORMAT = "%(asctime)-15s %(message)s"
-    #logging.basicConfig(filename='TweetDB.log', level=logging.INFO, format=FORMAT)
-    
+   
     # begin streaming to database
     TDB.stream_to_db(auth=auth,engine=engine,parmdata=parmdata)
 
