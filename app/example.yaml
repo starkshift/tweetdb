@@ -1,0 +1,10 @@
+files:
+  twitter_keys:     /home/russ/Data/mykeys.p
+  db_file:          /home/russ/Data/twitter.db
+  log_file:         /home/russ/Data/TDB.log
+
+settings:
+  langs:            [en]
+  get_images:       True
+  log_interval:     20
+
