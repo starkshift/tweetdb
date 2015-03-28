@@ -1,11 +1,11 @@
 from __future__ import division
-NAME = "TweetDB"
+NAME = "tweetdb"
 VERSION = "0.1"
-DESCRIPTION = """Utilities for storing tweets in an sqlite db"""
+DESCRIPTION = """Utilities for storing tweets in an relational database."""
 AUTHOR = "Russell Miller"
 AUTHOR_EMAIL = ""
-URL = ""
-LICENSE = "Gnu GPL v3"
+URL = "https://github.com/starkshift/tweetdb"
+LICENSE = "MIT"
 
 import tweepy
 import sqlite3
@@ -15,6 +15,10 @@ import certifi
 import zlib
 import logging
 import requests
+import md5
+import os
+import shutil
+import threading
 from yaml import load 
 from datetime import datetime as dt
 from sqlalchemy import create_engine, ForeignKey
@@ -22,6 +26,7 @@ from sqlalchemy import Column, Date, DateTime, Integer, String, Boolean, BigInte
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship, backref, sessionmaker
 
+# set up the sql base
 Base = declarative_base()
 
 # get rootLogger
@@ -29,9 +34,6 @@ rootLogger = logging.getLogger("root")
 
 # open https pool for grabbing url data
 https = urllib3.PoolManager(cert_reqs="CERT_REQUIRED", ca_certs=certifi.where())
-
-def test_logger(message):
-    rootLogger.info(message)
 
 def read_parmdata(parmfile):
     # parse a YAML parameter file
@@ -62,6 +64,12 @@ def drop_tables(engine):
         rootLogger.info('Dropping database tables.')
         Base.metadata.drop_all(engine)
 
+def drop_images(parmdata):
+    dropflag = raw_input('WARNING: Image storage directory will be deleted.  Proceed? [y/N] ')
+    if dropflag.upper() == 'Y':
+        rootLogger.info('Remove image directory.')
+        shutil.rmtree(parmdata['settings']['image_storage']['path'],ignore_errors=True)
+
 def read_timeline(engine,auth,parmdata,userid=None):
     api = tweepy.API(auth)
     
@@ -88,38 +96,34 @@ def read_timeline(engine,auth,parmdata,userid=None):
   
     session.close()
 
-def add_tweet(tweet,session,get_images=False):
+def add_tweet(tweet,session,get_images=False,image_path=None):
    # check if we've already added this tweet
    if session.query(Tweet).filter(Tweet.tweetid == tweet.id).count() == 0:
       tweetobj = Tweet(tweet)
       session.add(tweetobj)
-      session.commit()
-
+      
       for tag in tweet.entities['hashtags']:
           hashobj = Hashtag(tweet,tag)
           session.merge(hashobj)
-          session.commit()
-
+          
       for mention in tweet.entities['user_mentions']:
           mentionobj = Mention(tweet,mention)
           session.merge(mentionobj)
-          session.commit()
-
+          
       for url in tweet.entities['urls']:
           urlobj = URLData(tweet,url)
           session.merge(urlobj)
-          session.commit()
-
+          
       if tweet.geo is not None:
           geotagobj = Geotag(tweet)
           session.merge(geotagobj)
-          session.commit()
-      
+                
       if (get_images) and ('media' in tweet.entities):
-          for media in tweet.entities['media']:
-              mediaobj = Media(tweet,media)
+          for idx, media in enumerate(tweet.entities['media']):
+              mediaobj = Media(tweet,media,idx,image_path)
               session.merge(mediaobj)
-              session.commit()
+
+      session.commit()
       
    else:
       tweetobj = session.query(Tweet).filter(Tweet.tweetid==tweet.id).one()
@@ -130,28 +134,83 @@ def add_tweet(tweet,session,get_images=False):
 
 def add_user(user,session):
     if session.query(User).filter(User.userid==user.id).count() == 0:
-          userobj = User(user)
-          session.add(userobj)
-          session.commit()
+        userobj = User(user)
+        session.add(userobj)
+        session.commit()
     else:
-          userobj = session.query(User).filter(User.userid==user.id).one()
-          userobj.update(user)
-          session.add(userobj)
-          session.commit()
+        userobj = session.query(User).filter(User.userid==user.id).one()
+        userobj.update(user)
+        session.add(userobj)
+        session.commit()
           
+class tweet_handler(threading.Thread):
+    '''
+    This class manages the queue of tweets waiting to be added to the SQL database
+    '''
+    def __init__(self,queue,engine,parmdata,name=None):
+        # initialize the thread
+        threading.Thread.__init__(self,name=name)
 
-def stream_to_db(auth,engine,parmdata):
+        rootLogger.info("Starting new tweet handler.")
+ 
+        # this is meant to be a daemon process, exiting when the program closes
+        self.daemon = True
+ 
+        # bind this thread to the database
+        rootLogger.info('Connecting tweet handler to the database.')
+        Session=sessionmaker(bind=engine)
+        self.session = Session()
+
+        # set the queue to pull tweets from
+        self.queue = queue
+
+        self.languages  = parmdata['settings']['langs']
+
+        for lang in self.languages:
+            rootLogger.info('Logging tweets of language \'%s\'.'%lang)
+
+        self.get_images = parmdata['settings']['get_images']
+        rootLogger.info('Logging of image file data is set to \'%s\'.'%self.get_images)
+
+        self.log_interval = parmdata['settings']['log_interval']
+
+        if parmdata['settings']['image_storage']['method'].upper() == 'FILE':
+            self.image_path = parmdata['settings']['image_storage']['path']
+            if self.get_images:
+                rootLogger.info('Image data being stored on filesystem at \'%s\''%self.image_path)
+         
+        self.last_time = dt.now()
+        self.n_tweets = 0
+
+
+    def run(self):
+       while True:
+          status = self.queue.get()
+          if any(status.lang in s for s in self.languages) or any('ALL' in s.upper() for s in self.languages):
+              self.n_tweets+=1
+              add_user(status.author,self.session)
+              add_tweet(status,self.session,self.get_images,self.image_path)
+              self.status_update()
+          self.queue.task_done()  
+
+    def status_update(self):
+        elapsed_time = (dt.now() - self.last_time).total_seconds()
+        if elapsed_time > self.log_interval:
+            rootLogger.info("Capturing %f tweets/second (%f sec elapsed time)"%(self.n_tweets/elapsed_time,elapsed_time))
+            rootLogger.info("Reporting %d tweets remaining in queue."%self.queue.qsize())
+            self.last_time = dt.now()
+            self.n_tweets = 0
+
+
+
+def stream_to_db(auth,engine,queue,parmdata):
     while True: 
        try:
-          # make session
-          Session = sessionmaker(bind=engine)
-          session = Session()
-
           # set up twitter api
           api = tweepy.API(auth)
 
-          # set up strema listener
-          myListener = database_listener(session,api,parmdata)
+          # set up stream listener
+          myListener = database_listener(api,queue)
 
           stream = tweepy.streaming.Stream(auth,myListener,timeout=60)
           stream.sample()
@@ -159,17 +218,14 @@ def stream_to_db(auth,engine,parmdata):
           rootLogger.info('Keyboard interrupt detected.  Shutting down.')
           stream.disconnect()
           rootLogger.info('Stream disconnected.')
-          session.close()
-          rootLogger.info('Database session closed.')
-          break
+          return
        except requests.packages.urllib3.exceptions.ProtocolError:
           continue
        except:
+          while api.wait_on_rate_limit:
+              time.sleep(10)
+          queue.join()
           raise
-          #while api.wait_on_rate_limit:
-          #    time.sleep(10)
-          #continue
-    session.close()     
 
 
 ###########################################################
@@ -177,18 +233,9 @@ def stream_to_db(auth,engine,parmdata):
 ###########################################################
 class database_listener(tweepy.StreamListener):
     ''' Handles data received from the stream. '''
- 
-    n_total = 0
-    n_valid = 0
-    last_time = dt.now()
    
     def on_status(self, status):
-        self.n_total+=1
-        if any(status.lang in s for s in self.languages):
-            self.n_valid+=1
-            add_user(status.author,self.session)
-            add_tweet(status,self.session,self.get_images)
-        self.status_update()
+        self.queue.put(status)
         return True
  
     def on_error(self, status_code):
@@ -199,23 +246,10 @@ class database_listener(tweepy.StreamListener):
         print('Timeout...')
         return True # To continue listening
 
-    def __init__(self,session,api,parmdata):
-        self.session = session
+    def __init__(self,api,queue):
         self.api = api
-        self.languages  = parmdata['settings']['langs']
-        for lang in self.languages:
-            rootLogger.info('Logging tweets of language \'%s\'.'%lang)
-        self.get_images = parmdata['settings']['get_images']
-        rootLogger.info('Logging of image file data is set to \'%s\'.'%self.get_images)
-        self.update_time = parmdata['settings']['log_interval']
-
-    def status_update(self):
-        elapsed_time = (dt.now() - self.last_time).total_seconds()
-        if elapsed_time > self.update_time:
-            rootLogger.info("Capturing %f tweets/second (%f tweets/second after filtering, %f sec elapsed time)"%(self.n_total/elapsed_time,self.n_valid/elapsed_time,elapsed_time))
-            self.last_time = dt.now()
-            self.n_total = 0
-            self.n_valid = 0
+        self.queue = queue
+       
 
 
 ###########################################################
@@ -226,7 +260,7 @@ class Hashtag(Base):
     __tablename__ = "Hashtag"
     tweetid = Column('tweetid',BigInteger,ForeignKey("Tweet.tweetid"),unique=False,primary_key=True)
     tag = Column('tag',String,unique=False)
-    
+        
     def __init__(self,tweet,tag):
         self.tweetid = tweet.id
         self.tag = tag['text']
@@ -235,14 +269,29 @@ class Media(Base):
     """Binary Media Data"""
     __tablename__ = "Media"
     tweetid = Column('tweetid',BigInteger,ForeignKey("Tweet.tweetid"),unique=False,primary_key=True)
-    mediatype = Column('mediatype',String,unique=False)
-    blob = Column('blob',Binary,unique=False)
+    blob = Column('blob',Binary,unique=False,nullable=True)
+    native_filename = Column('native_filename',String,unique=False,nullable=True)
+    local_filename = Column('local_filename',String,unique=False,nullable=True)
     
-    def __init__(self,tweet,media):
+    def __init__(self,tweet,media,idx,image_path=None):
         self.tweetid = tweet.id
-        self.mediatype= media['type']
         rawdata = https.request('GET',media['media_url_https']).data
-        self.blob = zlib.compress(rawdata)
+        extension = os.path.splitext(media['media_url_https'])[1]
+        self.native_filename = os.path.split(media['media_url_https'])[1]
+        if image_path is None:
+            self.blob = zlib.compress(rawdata)
+            self.filename = None
+        else:
+            self.blob = None
+            md5hash = md5.new()
+            md5hash.update(str(tweet.id) + str(idx))
+            hashdata = md5hash.hexdigest()
+            self.local_filename = image_path + os.path.sep + hashdata[0:2] + os.path.sep + hashdata[3:5] + os.path.sep + hashdata[6:8] + os.path.sep + hashdata[9:] + extension
+            if not os.path.exists(os.path.dirname(self.local_filename)):
+                os.makedirs(os.path.dirname(self.local_filename),mode=0777)
+            with open(self.local_filename,'wb') as f:
+                f.write(rawdata)
+            
 
 class URLData(Base): 
     """URL Data"""
@@ -318,32 +367,43 @@ class User(Base):
 
     userid = Column(BigInteger,primary_key=True)
     username = Column('username',String)
+    name = Column('name',String)
     location = Column('location',String,nullable=True)
     description = Column('description',String,nullable=True)
     numfollowers = Column('numfollowers',Integer)
     numfriends = Column('numfriends',Integer)
-    numtweets = Column('numtweets',Integer)
+    numtweets = Column('numtweets',Integer) 
+    createdat = Column('createdat',DateTime)
+    timezone = Column('timezone',String)
     geoloc = Column('geoloc',Boolean)
     lastupdate = Column('lastupdate',DateTime)
+    verified = Column('verified',Boolean)
     tweets = relationship(Tweet,primaryjoin=userid==Tweet.userid,lazy="dynamic")
 
     def __init__(self,author):  
         self.userid = author.id
-        self.username = author.name
+        self.username = author.screen_name
+        self.name = author.name
         self.location = author.location
         self.description = author.description
         self.numfollowers = author.followers_count
         self.numfriends = author.friends_count
         self.numtweets = author.statuses_count
+        self.createdat = author.created_at
+        self.timezone = author.time_zone
         self.geoloc = author.geo_enabled
+        self.verified = author.verified
         self.lastupdate = dt.now()
 
     def update(self,author):  
-        self.username = author.name
+        self.username = author.screen_name
+        self.name = author.name
         self.location = author.location
         self.description = author.description
         self.numfollowers = author.followers_count
         self.numfriends = author.friends_count
         self.numtweets = author.statuses_count
+        self.timezone = author.time_zone
         self.geoloc = author.geo_enabled
+        self.verified = author.verified
         self.lastupdate = dt.now()
