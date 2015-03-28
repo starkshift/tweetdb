@@ -5,6 +5,8 @@ import logging
 import argparse
 import sys
 import threading
+import time
+from multiprocessing import cpu_count
 import Queue 
 
 def main():
@@ -30,7 +32,7 @@ def main():
     parmdata = tdb.read_parmdata(args.parmfile)
 
     # set up the logger
-    logFormatter = logging.Formatter("%(asctime)s [%(filename)-18s] [%(levelname)-5.5s] [%(threadName)-5s]  %(message)s")
+    logFormatter = logging.Formatter("%(asctime)s [%(filename)-5.5s] [%(levelname)-5.5s] [%(threadName)-5s]  %(message)s")
     rootLogger = logging.getLogger('root')
     rootLogger.setLevel('INFO')
     
@@ -54,7 +56,11 @@ def main():
     rootLogger.info('Setting up data queue.')
     queue = Queue.Queue(100)
     
-    for i in range(3):
+    # spin up the tweet handlers
+    if parmdata['settings']['num_threads'] > cpu_count():
+        rootLogger.info('Requested %d threads.  Limited to number of cores (%d threads).'%(parmdata['settings']['num_threads'],cpu_count()))
+        parmdata['settings']['num_threads'] = cpu_count()
+    for i in range(parmdata['settings']['num_threads']):
         t = tdb.tweet_handler(queue,engine,parmdata,name="worker%d"%i)
         t.start()
 
@@ -70,6 +76,9 @@ def main():
     # begin streaming to database
     tdb.stream_to_db(auth=auth,engine=engine,queue=queue,parmdata=parmdata)
 
+    while queue.qsize() > 0:
+        time.sleep(1)
+    
     return
 
 if __name__ == '__main__':

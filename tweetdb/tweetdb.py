@@ -65,7 +65,7 @@ def drop_tables(engine):
         Base.metadata.drop_all(engine)
 
 def drop_images(parmdata):
-    dropflag = raw_input('WARNING: Image storage directory will be deleted.  Proceed? [y/N] ')
+    dropflag = raw_input('WARNING: Image storage directory (\'%s\') will be deleted.  Proceed? [y/N] '%(parmdata['settings']['image_storage']['path']))
     if dropflag.upper() == 'Y':
         rootLogger.info('Remove image directory.')
         shutil.rmtree(parmdata['settings']['image_storage']['path'],ignore_errors=True)
@@ -157,7 +157,7 @@ class tweet_handler(threading.Thread):
         self.daemon = True
  
         # bind this thread to the database
-        rootLogger.info('Connecting tweet handler to the database.')
+        rootLogger.info('Connecting to the database.')
         Session=sessionmaker(bind=engine)
         self.session = Session()
 
@@ -170,7 +170,7 @@ class tweet_handler(threading.Thread):
             rootLogger.info('Logging tweets of language \'%s\'.'%lang)
 
         self.get_images = parmdata['settings']['get_images']
-        rootLogger.info('Logging of image file data is set to \'%s\'.'%self.get_images)
+        rootLogger.info('Logging image file data is set to \'%s\'.'%self.get_images)
 
         self.log_interval = parmdata['settings']['log_interval']
 
@@ -186,12 +186,20 @@ class tweet_handler(threading.Thread):
     def run(self):
        while True:
           status = self.queue.get()
+          self.queue.task_done()
           if any(status.lang in s for s in self.languages) or any('ALL' in s.upper() for s in self.languages):
               self.n_tweets+=1
-              add_user(status.author,self.session)
-              add_tweet(status,self.session,self.get_images,self.image_path)
+              # there is a small chance that two threads will try to add the same user concurrently
+              # this try statement serves to get arround the sqlalchemy error that would result
+              try:
+                  add_user(status.author,self.session)
+                  add_tweet(status,self.session,self.get_images,self.image_path)
+              except sqlachemy.exc.IntegrityError:
+                  pass
+              except KeyboardInterrupt:
+                  pass
               self.status_update()
-          self.queue.task_done()  
+          #self.queue.task_done()  
 
     def status_update(self):
         elapsed_time = (dt.now() - self.last_time).total_seconds()
@@ -215,7 +223,7 @@ def stream_to_db(auth,engine,queue,parmdata):
           stream = tweepy.streaming.Stream(auth,myListener,timeout=60)
           stream.sample()
        except KeyboardInterrupt:
-          rootLogger.info('Keyboard interrupt detected.  Shutting down.')
+          rootLogger.info('Keyboard interrupt detected.  Depleting queue and preparing to shutdown.')
           stream.disconnect()
           rootLogger.info('Stream disconnected.')
           return
