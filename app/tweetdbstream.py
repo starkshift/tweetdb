@@ -33,7 +33,7 @@ def main():
 
     # set up the logger
     logFormatter = logging.Formatter("%(asctime)s [%(filename)-5.5s] [%(levelname)-5.5s] [%(threadName)-5s]  %(message)s")
-    rootLogger = logging.getLogger('root')
+    rootLogger = logging.getLogger('__name__')
     rootLogger.setLevel('INFO')
     
     if parmdata['files']['log_file'] is not None:

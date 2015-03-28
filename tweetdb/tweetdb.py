@@ -25,15 +25,13 @@ from sqlalchemy import create_engine, ForeignKey
 from sqlalchemy import Column, Date, DateTime, Integer, String, Boolean, BigInteger, Float, Binary
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship, backref, sessionmaker
+from sqlalchemy.exc import IntegrityError
 
 # set up the sql base
 Base = declarative_base()
 
 # get rootLogger
-rootLogger = logging.getLogger("root")
-
-# open https pool for grabbing url data
-https = urllib3.PoolManager(cert_reqs="CERT_REQUIRED", ca_certs=certifi.where())
+log = logging.getLogger("__name__")
 
 def read_parmdata(parmfile):
     # parse a YAML parameter file
@@ -55,20 +53,21 @@ def get_sql_engine(parmdata):
         return create_engine('postgresql://' + dblogin['username'] + ':' + dblogin['password'] + '@' + parmdata['database']['db_host'] + '/' + parmdata['database']['db_name'],echo=False)
 
 def create_tables(engine):
-    rootLogger.info('Creating database tables.')
+    log.info('Creating database tables.')
     Base.metadata.create_all(engine)
 
 def drop_tables(engine):
     dropflag = raw_input('WARNING: All tables in database will be dropped.  Proceed? [y/N] ')
     if dropflag.upper() == 'Y':
-        rootLogger.info('Dropping database tables.')
+        log.info('Dropping database tables.')
         Base.metadata.drop_all(engine)
 
 def drop_images(parmdata):
     dropflag = raw_input('WARNING: Image storage directory (\'%s\') will be deleted.  Proceed? [y/N] '%(parmdata['settings']['image_storage']['path']))
     if dropflag.upper() == 'Y':
-        rootLogger.info('Remove image directory.')
-        shutil.rmtree(parmdata['settings']['image_storage']['path'],ignore_errors=True)
+        log.info('Remove image directory.')
+        # shutil.rmtree(parmdata['settings']['image_storage']['path'],ignore_errors=True)
+        os.system('rm -fr "%s"'%parmdata['settings']['image_storage']['path'])
 
 def read_timeline(engine,auth,parmdata,userid=None):
     api = tweepy.API(auth)
@@ -96,7 +95,7 @@ def read_timeline(engine,auth,parmdata,userid=None):
   
     session.close()
 
-def add_tweet(tweet,session,get_images=False,image_path=None):
+def add_tweet(tweet,session,get_images=False,image_path=None,https=None):
    # check if we've already added this tweet
    if session.query(Tweet).filter(Tweet.tweetid == tweet.id).count() == 0:
       tweetobj = Tweet(tweet)
@@ -120,7 +119,7 @@ def add_tweet(tweet,session,get_images=False,image_path=None):
                 
       if (get_images) and ('media' in tweet.entities):
           for idx, media in enumerate(tweet.entities['media']):
-              mediaobj = Media(tweet,media,idx,image_path)
+              mediaobj = Media(tweet,media,idx,image_path,https)
               session.merge(mediaobj)
 
       session.commit()
@@ -147,38 +146,48 @@ class tweet_handler(threading.Thread):
     '''
     This class manages the queue of tweets waiting to be added to the SQL database
     '''
+
+    # open https pool for grabbing url data
+    https = urllib3.PoolManager(cert_reqs="CERT_REQUIRED", ca_certs=certifi.where())
+
     def __init__(self,queue,engine,parmdata,name=None):
         # initialize the thread
         threading.Thread.__init__(self,name=name)
 
-        rootLogger.info("Starting new tweet handler.")
+        log.info("Starting new tweet handler.")
  
         # this is meant to be a daemon process, exiting when the program closes
         self.daemon = True
+
+        # update the log from this thread at this interval
+        self.log_interval = parmdata['settings']['log_interval']
  
         # bind this thread to the database
-        rootLogger.info('Connecting to the database.')
+        log.info('Connecting to the database.')
         Session=sessionmaker(bind=engine)
         self.session = Session()
 
         # set the queue to pull tweets from
         self.queue = queue
 
+        # twitter's stream filtering for languages is currently (March 2015) broken
+        # (you need to have a search term in addition to a language in order to filter,
+        # but we want the full stream so we'll do the language filter ourselves)
         self.languages  = parmdata['settings']['langs']
 
         for lang in self.languages:
-            rootLogger.info('Logging tweets of language \'%s\'.'%lang)
+            log.info('Logging tweets of language \'%s\'.'%lang)
 
+        # set up whether we're getting tweeted images or not
         self.get_images = parmdata['settings']['get_images']
-        rootLogger.info('Logging image file data is set to \'%s\'.'%self.get_images)
-
-        self.log_interval = parmdata['settings']['log_interval']
+        log.info('Logging image file data is set to \'%s\'.'%self.get_images)
 
         if parmdata['settings']['image_storage']['method'].upper() == 'FILE':
             self.image_path = parmdata['settings']['image_storage']['path']
             if self.get_images:
-                rootLogger.info('Image data being stored on filesystem at \'%s\''%self.image_path)
-         
+                log.info('Image data being stored on filesystem at \'%s\''%self.image_path)
+        
+        # some diagnostic variables 
         self.last_time = dt.now()
         self.n_tweets = 0
 
@@ -190,22 +199,27 @@ class tweet_handler(threading.Thread):
           if any(status.lang in s for s in self.languages) or any('ALL' in s.upper() for s in self.languages):
               self.n_tweets+=1
               # there is a small chance that two threads will try to add the same user concurrently
-              # this try statement serves to get arround the sqlalchemy error that would result
+              # this try statement serves to get arround the sqlalchemy IntegrityError which would result
               try:
                   add_user(status.author,self.session)
-                  add_tweet(status,self.session,self.get_images,self.image_path)
-              except sqlachemy.exc.IntegrityError:
+                  add_tweet(status,self.session,self.get_images,self.image_path,self.https)
+              except IntegrityError:
+                  self.session.rollback()
                   pass
               except KeyboardInterrupt:
                   pass
-              self.status_update()
-          #self.queue.task_done()  
+              except:
+                  raise
+          self.status_update()
 
     def status_update(self):
+        '''
+        Method for keeping track of the rate at which each tweet handler is processing the queue
+        '''
         elapsed_time = (dt.now() - self.last_time).total_seconds()
         if elapsed_time > self.log_interval:
-            rootLogger.info("Capturing %f tweets/second (%f sec elapsed time)"%(self.n_tweets/elapsed_time,elapsed_time))
-            rootLogger.info("Reporting %d tweets remaining in queue."%self.queue.qsize())
+            log.info("Capturing %f tweets/second (%f sec elapsed time)."%(self.n_tweets/elapsed_time,elapsed_time))
+            log.info("Reporting %d tweets remaining in queue."%self.queue.qsize())
             self.last_time = dt.now()
             self.n_tweets = 0
 
@@ -223,9 +237,9 @@ def stream_to_db(auth,engine,queue,parmdata):
           stream = tweepy.streaming.Stream(auth,myListener,timeout=60)
           stream.sample()
        except KeyboardInterrupt:
-          rootLogger.info('Keyboard interrupt detected.  Depleting queue and preparing to shutdown.')
+          log.info('Keyboard interrupt detected.  Depleting queue and preparing to shutdown.')
           stream.disconnect()
-          rootLogger.info('Stream disconnected.')
+          log.info('Stream disconnected.')
           return
        except requests.packages.urllib3.exceptions.ProtocolError:
           continue
@@ -240,18 +254,22 @@ def stream_to_db(auth,engine,queue,parmdata):
 #         Tweepy Listener Class Definitions
 ###########################################################
 class database_listener(tweepy.StreamListener):
-    ''' Handles data received from the stream. '''
+    '''
+    Takes data received from the streaming API and places it in the
+    queue to be processed by tweet_handlers  
+
+    '''
    
     def on_status(self, status):
         self.queue.put(status)
         return True
  
     def on_error(self, status_code):
-        print('Got an error with status code: ' + str(status_code))
+        log.info('Got an error with status code: ' + str(status_code))
         return True # To continue listening
  
     def on_timeout(self):
-        print('Timeout...')
+        log.info('Listener timeout.')
         return True # To continue listening
 
     def __init__(self,api,queue):
@@ -281,7 +299,7 @@ class Media(Base):
     native_filename = Column('native_filename',String,unique=False,nullable=True)
     local_filename = Column('local_filename',String,unique=False,nullable=True)
     
-    def __init__(self,tweet,media,idx,image_path=None):
+    def __init__(self,tweet,media,idx,image_path=None,https=None):
         self.tweetid = tweet.id
         rawdata = https.request('GET',media['media_url_https']).data
         extension = os.path.splitext(media['media_url_https'])[1]
