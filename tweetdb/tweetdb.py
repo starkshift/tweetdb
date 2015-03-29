@@ -8,7 +8,6 @@ URL = "https://github.com/starkshift/tweetdb"
 LICENSE = "MIT"
 
 import tweepy
-import sqlite3
 import pickle
 import urllib3
 import certifi
@@ -17,14 +16,14 @@ import logging
 import requests
 import md5
 import os
-import shutil
 import threading
-from yaml import load 
+from yaml import load
 from datetime import datetime as dt
 from sqlalchemy import create_engine, ForeignKey
-from sqlalchemy import Column, Date, DateTime, Integer, String, Boolean, BigInteger, Float, Binary
+from sqlalchemy import Column, DateTime, Integer, String, Boolean, BigInteger, \
+    Float, Binary
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import relationship, backref, sessionmaker
+from sqlalchemy.orm import relationship, sessionmaker
 from sqlalchemy.exc import IntegrityError
 
 # set up the sql base
@@ -33,43 +32,58 @@ Base = declarative_base()
 # get rootLogger
 log = logging.getLogger("__name__")
 
+
 def read_parmdata(parmfile):
     # parse a YAML parameter file
-    with open(parmfile,'r') as f:
+    with open(parmfile, 'r') as f:
         return load(f)
+
 
 def get_oauth(parmdata):
     # authenticate to twitter
-    keys = pickle.load(open(parmdata['files']['twitter_keys'],'rb'))
-    auth = tweepy.OAuthHandler(keys['ConsumerKey'],keys['ConsumerSecret'])
-    auth.set_access_token(keys['AccessToken'],keys['AccessTokenSecret'])
+    keys = pickle.load(open(parmdata['files']['twitter_keys'], 'rb'))
+    auth = tweepy.OAuthHandler(keys['ConsumerKey'], keys['ConsumerSecret'])
+    auth.set_access_token(keys['AccessToken'], keys['AccessTokenSecret'])
     return auth
     
+
 def get_sql_engine(parmdata):
     if parmdata['database']['db_type'].upper() == 'SQLITE':
-        return create_engine('sqlite:///' + parmdata['database']['db_host'],echo=False)
+        return create_engine('sqlite:///' + parmdata['database']['db_host'],
+                             echo=False)
     elif parmdata['database']['db_type'].upper() == 'POSTGRES':
-        dblogin = pickle.load(open(parmdata['database']['db_login'],'rb'))
-        return create_engine('postgresql://' + dblogin['username'] + ':' + dblogin['password'] + '@' + parmdata['database']['db_host'] + '/' + parmdata['database']['db_name'],echo=False)
+        dblogin = pickle.load(open(parmdata['database']['db_login'], 'rb'))
+        return create_engine('postgresql://' + dblogin['username'] + ':' +
+                             dblogin['password'] + '@'
+                             + parmdata['database']['db_host']
+                             + '/' + parmdata['database']['db_name'],
+                             echo=False)
+
 
 def create_tables(engine):
     log.info('Creating database tables.')
     Base.metadata.create_all(engine)
 
+
 def drop_tables(engine):
-    dropflag = raw_input('WARNING: All tables in database will be dropped.  Proceed? [y/N] ')
+    dropflag = raw_input('WARNING: All tables in database will' +
+                         'be dropped.  Proceed? [y/N] ')
     if dropflag.upper() == 'Y':
         log.info('Dropping database tables.')
         Base.metadata.drop_all(engine)
 
+
 def drop_images(parmdata):
-    dropflag = raw_input('WARNING: Image storage directory (\'%s\') will be deleted.  Proceed? [y/N] '%(parmdata['settings']['image_storage']['path']))
+    image_path = parmdata['settings']['image_storage']['path']
+    dropflag = raw_input('WARNING: Image storage directory (\'%s\') will be' +
+                         'deleted.  Proceed? [y/N] '
+                         % (image_path))
     if dropflag.upper() == 'Y':
         log.info('Remove image directory.')
-        # shutil.rmtree(parmdata['settings']['image_storage']['path'],ignore_errors=True)
-        os.system('rm -fr "%s"'%parmdata['settings']['image_storage']['path'])
+        os.system('rm -fr "%s"' % image_path)
 
-def read_timeline(engine,auth,parmdata,userid=None):
+
+def read_timeline(engine, auth, parmdata, userid=None):
     api = tweepy.API(auth)
     
     try:
@@ -94,6 +108,7 @@ def read_timeline(engine,auth,parmdata,userid=None):
        raise
   
     session.close()
+
 
 def add_tweet(tweet,session,get_images=False,image_path=None,https=None):
    # check if we've already added this tweet
