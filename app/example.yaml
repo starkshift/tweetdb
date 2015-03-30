@@ -3,7 +3,7 @@ files:
   log_file:         /home/russ/Data/TDB.log
 
 database:
-  db_type:          sqlite
+  db_type:          postgres
   db_host:          localhost
   db_name:          twitter
   db_login:         /home/russ/Data/dblogin.p
@@ -11,8 +11,8 @@ database:
 settings:
   langs:            [en]
   log_interval:     20
-  get_images:       True
-  num_threads:      1
+  get_images:       False
+  num_threads:      3
   image_storage:
     method:         file
     path:           /home/russ/Data/images

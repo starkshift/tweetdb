@@ -66,10 +66,19 @@ def main():
     
     # spin up the tweet handlers
     if parmdata['settings']['num_threads'] > cpu_count():
-        rootLogger.info('Requested %d threads.  Limited to number of cores '
+        rootLogger.info('Requested %d threads. '
+                        % parmdata['settings']['num_threads'] +
+                        'Limited to number of cores ' +
                         '(%d threads).'
                         % (parmdata['settings']['num_threads'], cpu_count()))
         parmdata['settings']['num_threads'] = cpu_count()
+
+    if parmdata['database']['db_type'].upper() == "SQLITE":
+        rootLogger.info('Requested %d threads '
+                        % parmdata['settings']['num_threads'] +
+                        'but SQLite supports only 1.')
+        parmdata['settings']['num_threads'] = 1
+
     for i in range(parmdata['settings']['num_threads']):
         t = tdb.tweet_handler(queue, engine, parmdata, name="worker%d" % i)
         t.start()

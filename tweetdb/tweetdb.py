@@ -75,8 +75,8 @@ def drop_tables(engine):
 
 def drop_images(parmdata):
     image_path = parmdata['settings']['image_storage']['path']
-    dropflag = raw_input('WARNING: Image storage directory (\'%s\') will be deleted.  Proceed? [y/N] '
-                         % (image_path))
+    dropflag = raw_input('WARNING: Image storage directory (\'%s\') will be' +
+                         'deleted.  Proceed? [y/N] ' % (image_path))
     if dropflag.upper() == 'Y':
         log.info('Remove image directory.')
         os.system('rm -fr "%s"' % image_path)
@@ -269,12 +269,11 @@ def stream_to_db(auth, engine, queue, parmdata):
             log.info('Stream disconnected.')
             return
         except requests.packages.urllib3.exceptions.ProtocolError:
-            continue
+            pass
         except:
             while api.wait_on_rate_limit:
                 time.sleep(10)
-            queue.join()
-            raise
+            pass
 
 
 ###########################################################
