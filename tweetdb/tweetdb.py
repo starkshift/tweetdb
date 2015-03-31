@@ -66,7 +66,7 @@ def create_tables(engine):
 
 
 def drop_tables(engine):
-    dropflag = raw_input('WARNING: All tables in database will' +
+    dropflag = raw_input('WARNING: All tables in database will ' +
                          'be dropped.  Proceed? [y/N] ')
     if dropflag.upper() == 'Y':
         log.info('Dropping database tables.')
@@ -75,8 +75,9 @@ def drop_tables(engine):
 
 def drop_images(parmdata):
     image_path = parmdata['settings']['image_storage']['path']
-    dropflag = raw_input('WARNING: Image storage directory (\'%s\') will be' +
-                         'deleted.  Proceed? [y/N] ' % (image_path))
+    dropflag = raw_input('WARNING: Image storage directory ' +
+                         '(\'%s\') will be' % (image_path) +
+                         'deleted.  Proceed? [y/N] ')
     if dropflag.upper() == 'Y':
         log.info('Remove image directory.')
         os.system('rm -fr "%s"' % image_path)
