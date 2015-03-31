@@ -190,8 +190,8 @@ class tweet_handler(threading.Thread):
         '''
         twitter's stream filtering for languages is currently (March 2015)
         broken (you need to have a search term in addition to a language
-        in order to filter, but we want the full stream so we'll do the
-        language filter ourselves)
+        in order to filter), but we want the full stream so we'll do the
+        language filter ourselves
         '''
         self.languages = parmdata['settings']['langs']
         for lang in self.languages:
@@ -257,23 +257,30 @@ def stream_to_db(auth, engine, queue, parmdata):
         try:
             # set up twitter api
             api = tweepy.API(auth)
+            myListeners = []
+            streams = []
+            threads = []
+            for n in range(2):
+                # set up stream listener
+                myListeners[n] = database_listener(api, queue)
 
-            # set up stream listener
-            myListener = database_listener(api, queue)
-
-            stream = tweepy.streaming.Stream(auth, myListener, timeout=60)
-            stream.sample()
+                streams[n] = tweepy.streaming.Stream(auth,
+                                    myListeners[n], timeout=60)
+                thread = threading.Thread(target=streams[n].sample())
+                thread.start()
+                threads.append(thread)
         except KeyboardInterrupt:
             log.info('Keyboard interrupt detected.  Depleting queue and ' +
                      'preparing to shutdown.')
-            stream.disconnect()
+            for thread in threads:
+                thread.stop()
             log.info('Stream disconnected.')
             return
         except requests.packages.urllib3.exceptions.ProtocolError:
             pass
         except:
             while api.wait_on_rate_limit:
-                time.sleep(10)
+                time.sleep(500)
             pass
 
 
@@ -319,7 +326,7 @@ class Hashtag(Base):
         self.tag = tag['text']
 
 
-class Media(Base): 
+class Media(Base):
     """Binary Media Data"""
     __tablename__ = "Media"
     tweetid = Column('tweetid', BigInteger, ForeignKey("Tweet.tweetid"),
