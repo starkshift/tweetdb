@@ -158,7 +158,7 @@ def add_user(user, session):
         session.commit()
           
 
-class tweet_handler(threading.Thread):
+class tweet_consumer(threading.Thread):
     '''
     This class manages the queue of tweets waiting to be added to the
     SQL database
@@ -172,7 +172,7 @@ class tweet_handler(threading.Thread):
         # initialize the thread
         threading.Thread.__init__(self, name=name)
 
-        log.info("Starting new tweet handler.")
+        log.info("Starting new tweet consumer.")
  
         # this is meant to be a daemon process, exiting when the program closes
         self.daemon = True
@@ -181,7 +181,7 @@ class tweet_handler(threading.Thread):
         self.log_interval = parmdata['settings']['log_interval']
  
         # bind this thread to the database
-        log.info('Connecting to the database.')
+        log.info('Establishing database session..')
         Session = sessionmaker(bind=engine)
         self.session = Session()
 
@@ -210,6 +210,7 @@ class tweet_handler(threading.Thread):
         # some diagnostic variables
         self.last_time = dt.now()
         self.n_tweets = 0
+        self.n_dupes = 0
 
     def run(self):
         while True:
@@ -217,10 +218,9 @@ class tweet_handler(threading.Thread):
             self.queue.task_done()
             if any(status.lang in s for s in self.languages) or \
                any('ALL' in s.upper() for s in self.languages):
-                self.n_tweets += 1
                 '''
-                there is a small chance that two threads will try
-                to add the same user concurrently this try statement
+                There is a small chance that two threads will try
+                to add the same user concurrently. This try statement
                 serves to get arround the sqlalchemy IntegrityError
                 which would result
                 '''
@@ -228,10 +228,10 @@ class tweet_handler(threading.Thread):
                     add_user(status.author, self.session)
                     add_tweet(status, self.session, self.get_images,
                               self.image_path, self.https)
+                    self.n_tweets += 1
                 except IntegrityError:
+                    self.n_dupes += 1
                     self.session.rollback()
-                    pass
-                except KeyboardInterrupt:
                     pass
                 except:
                     raise
@@ -239,54 +239,63 @@ class tweet_handler(threading.Thread):
 
     def status_update(self):
         '''
-        Method for keeping track of the rate at which each tweet handler is
+        Method for keeping track of the rate at which each tweet consumer is
         processing the queue
         '''
         elapsed_time = (dt.now() - self.last_time).total_seconds()
         if elapsed_time > self.log_interval:
-            log.info("Capturing %f tweets/second (%f sec elapsed time)." %
-                     (self.n_tweets/elapsed_time, elapsed_time))
+            log.info("Capturing %f tweets/second (%f/sec discarded as duplicates)." %
+                     (self.n_tweets/elapsed_time, self.n_dupes/elapsed_time))
             log.info("Reporting %d tweets remaining in queue." %
                      self.queue.qsize())
             self.last_time = dt.now()
             self.n_tweets = 0
+            self.n_dupes = 0
 
 
-def stream_to_db(auth, engine, queue, parmdata):
-    while True:
-        try:
-            # set up twitter api
-            api = tweepy.API(auth)
-            myListeners = []
-            streams = []
-            threads = []
-            for n in range(2):
+class tweet_producer(threading.Thread):
+    def __init__(self, auth, queue, parmdata, name=None):
+        # initialize the thread
+        threading.Thread.__init__(self, name=name)
+
+        log.info("Starting new tweet producer.")
+        self.auth = auth
+        self.queue = queue
+        self.parmdata = parmdata
+        self.daemon = True
+        self.active = True
+
+    def run(self):
+        while self.active:
+            try:
+                # set up twitter api
+                self.api = tweepy.API(self.auth)
+                
                 # set up stream listener
-                myListeners[n] = database_listener(api, queue)
-
-                streams[n] = tweepy.streaming.Stream(auth,
-                                    myListeners[n], timeout=60)
-                thread = threading.Thread(target=streams[n].sample())
-                thread.start()
-                threads.append(thread)
-        except KeyboardInterrupt:
-            log.info('Keyboard interrupt detected.  Depleting queue and ' +
-                     'preparing to shutdown.')
-            for thread in threads:
-                thread.stop()
-            log.info('Stream disconnected.')
-            return
-        except requests.packages.urllib3.exceptions.ProtocolError:
-            pass
-        except:
-            while api.wait_on_rate_limit:
-                time.sleep(500)
-            pass
-
+                self.myListener = database_listener(self.api, self.queue)
+                
+                self.stream =  tweepy.streaming.Stream(self.auth,
+                                                self.myListener, timeout=60)
+                log.info("Streaming API connected.  Adding tweets to queue.")
+                self.stream.sample()
+            except requests.packages.urllib3.exceptions.ProtocolError:
+                pass
+            except Exception as e:
+                log.error(str(e))
+                self.active = False
+                raise
+ 
+    def close(self):
+        log.info("Disconnecting Twitter stream.")
+        self.stream.disconnect()
+        self.active = False
+        self.join()
 
 ###########################################################
 #         Tweepy Listener Class Definitions
 ###########################################################
+
+
 class database_listener(tweepy.StreamListener):
     '''
     Takes data received from the streaming API and places it in the
@@ -317,8 +326,9 @@ class database_listener(tweepy.StreamListener):
 class Hashtag(Base):
     """Hashtag Data"""
     __tablename__ = "Hashtag"
+    hashid = Column('hashid', Integer, primary_key=True)
     tweetid = Column('tweetid', BigInteger, ForeignKey("Tweet.tweetid"),
-                     unique=False, primary_key=True)
+                     unique=False)
     tag = Column('tag', String, unique=False)
         
     def __init__(self, tweet, tag):
@@ -329,8 +339,9 @@ class Hashtag(Base):
 class Media(Base):
     """Binary Media Data"""
     __tablename__ = "Media"
+    mediaid = Column('mediaid', Integer, primary_key=True)
     tweetid = Column('tweetid', BigInteger, ForeignKey("Tweet.tweetid"),
-                     unique=False, primary_key=True)
+                     unique=False)
     blob = Column('blob', Binary, unique=False, nullable=True)
     native_filename = Column('native_filename', String, unique=False,
                              nullable=True)
@@ -363,8 +374,9 @@ class Media(Base):
 class URLData(Base):
     """URL Data"""
     __tablename__ = "URLData"
+    urlid = Column('urlid', Integer, primary_key=True)
     tweetid = Column('tweetid', BigInteger, ForeignKey("Tweet.tweetid"),
-                     unique=False, primary_key=True)
+                     unique=False)
     url = Column('url', String, unique=False)
     
     def __init__(self, tweet, url):
@@ -375,8 +387,9 @@ class URLData(Base):
 class Mention(Base):
     """User Mention Data"""
     __tablename__ = "Mention"
+    mentionid = Column('mentionid', Integer, primary_key=True)
     tweetid = Column('tweetid', BigInteger, ForeignKey("Tweet.tweetid"),
-                     unique=False, primary_key=True)
+                     unique=False)
     source = Column('source', BigInteger, unique=False)
     target = Column('target', BigInteger, unique=False)
     
@@ -389,8 +402,9 @@ class Mention(Base):
 class Geotag(Base):
     """Geotag Data"""
     __tablename__ = "Geotag"
+    geoid = Column('geoid', Integer, primary_key=True)
     tweetid = Column('tweetid', BigInteger, ForeignKey("Tweet.tweetid"),
-                     unique=False, primary_key=True)
+                     unique=False)
     latitude = Column('latitude', Float, unique=False)
     longitude = Column('longitude', Float, unique=False)
     

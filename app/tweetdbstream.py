@@ -6,6 +6,7 @@ import argparse
 import sys
 import time
 from multiprocessing import cpu_count
+import threading
 import Queue
 
 
@@ -64,25 +65,6 @@ def main():
     rootLogger.info('Setting up data queue.')
     queue = Queue.Queue(100)
     
-    # spin up the tweet handlers
-    if parmdata['settings']['num_threads'] > cpu_count():
-        rootLogger.info('Requested %d threads. '
-                        % parmdata['settings']['num_threads'] +
-                        'Limited to number of cores ' +
-                        '(%d threads).'
-                        % (parmdata['settings']['num_threads'], cpu_count()))
-        parmdata['settings']['num_threads'] = cpu_count()
-
-    if parmdata['database']['db_type'].upper() == "SQLITE":
-        rootLogger.info('Requested %d threads '
-                        % parmdata['settings']['num_threads'] +
-                        'but SQLite supports only 1.')
-        parmdata['settings']['num_threads'] = 1
-
-    for i in range(parmdata['settings']['num_threads']):
-        t = tdb.tweet_handler(queue, engine, parmdata, name="worker%d" % i)
-        t.start()
-
     # handle the drop/create table cases first
     if args.dropflag:
         tdb.drop_tables(engine)
@@ -92,13 +74,53 @@ def main():
     if args.createflag:
         tdb.create_tables(engine)
   
-    # begin streaming to database
-    tdb.stream_to_db(auth=auth, engine=engine, queue=queue, parmdata=parmdata)
+    # spin up the tweet handlers
+    if parmdata['settings']['num_consumers'] > cpu_count():
+        rootLogger.info('Requested %d consumers. '
+                        % parmdata['settings']['num_consumers'] +
+                        'Limited to number of cores ' +
+                        '(%d threads).' % cpu_count())
+        parmdata['settings']['num_consumers'] = cpu_count()
 
-    while queue.qsize() > 0:
-        time.sleep(1)
-    
-    return
+    if parmdata['settings']['num_producers'] > 2:
+        rootLogger.info('Requested %d producers. '
+                        % parmdata['settings']['num_producers'] +
+                        'Twitter API limits you to 2.')
+        parmdata['settings']['num_producers'] = 2
+
+    if parmdata['database']['db_type'].upper() == "SQLITE":
+        rootLogger.info('Requested %d threads '
+                        % parmdata['settings']['num_consumers'] +
+                        'but SQLite supports only 1.')
+        parmdata['settings']['num_consumers'] = 1
+        parmdata['settings']['num_producers'] = 1
+
+    consumers = []
+    for i in range(parmdata['settings']['num_consumers']):
+        consumers.append(tdb.tweet_consumer(queue, engine, parmdata,
+                                            name="consumer_%d" % i))
+        consumers[i].start()
+
+    # begin streaming to database
+    producers = []
+    for i in range(parmdata['settings']['num_producers']):
+        producers.append(tdb.tweet_producer(auth, queue, parmdata,
+                                            name="producer_%d" % i))
+        producers[i].start()
+  
+    #    while queue.qsize() > 0:
+    while True:
+        try:
+            time.sleep(1)
+        except KeyboardInterrupt:
+            rootLogger.info('Keyboard interrupt detected.  Depleting queue ' +
+                            'and preparing to shutdown.')
+            for producer in producers:
+                producer.close()
+            
+            while queue.qsize() > 0:
+                time.sleep(1)
+            return
 
 if __name__ == '__main__':
     main()
