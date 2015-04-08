@@ -5,9 +5,8 @@ import logging
 import argparse
 import sys
 import time
-from multiprocessing import cpu_count
-import threading
-import Queue
+from multiprocessing import cpu_count, Queue
+#import Queue
 
 
 def main():
@@ -39,7 +38,7 @@ def main():
 
     # set up the logger
     logFormatter = logging.Formatter("%(asctime)s [%(filename)-5.5s] "
-                                     "[%(levelname)-5.5s] [%(threadName)-5s] "
+                                     "[%(levelname)-5.5s] [%(processName)-5s] "
                                      "%(message)s")
     rootLogger = logging.getLogger('__name__')
     rootLogger.setLevel('INFO')
@@ -63,7 +62,7 @@ def main():
     rootLogger.info('Connecting to database.')
     engine = tdb.get_sql_engine(parmdata)
     rootLogger.info('Setting up data queue.')
-    queue = Queue.Queue(100)
+    queue = Queue(100)
     
     # handle the drop/create table cases first
     if args.dropflag:

@@ -17,7 +17,7 @@ import requests
 import md5
 import os
 import threading
-import time
+from multiprocessing import Process
 from yaml import load
 from datetime import datetime as dt
 from sqlalchemy import create_engine, ForeignKey
@@ -48,7 +48,7 @@ def get_oauth(parmdata):
     return auth
     
 
-def get_sql_engine(parmdata):
+def get_sql_engine(parmdata, echo=False):
     if parmdata['database']['db_type'].upper() == 'SQLITE':
         arg = 'sqlite:///' + parmdata['database']['db_host']
     elif parmdata['database']['db_type'].upper() == 'POSTGRES':
@@ -57,7 +57,13 @@ def get_sql_engine(parmdata):
               dblogin['password'] + '@' \
               + parmdata['database']['db_host'] \
               + '/' + parmdata['database']['db_name']
-    return create_engine(arg, echo=False)
+    return create_engine(arg, echo=echo)
+
+
+def get_sql_session(parmdata, echo=False):
+    engine = get_sql_engine(parmdata, echo=echo)
+    Session = sessionmaker(bind=engine)
+    return Session()
 
 
 def create_tables(engine):
@@ -158,7 +164,8 @@ def add_user(user, session):
         session.commit()
           
 
-class tweet_consumer(threading.Thread):
+# class tweet_consumer(threading.Thread):
+class tweet_consumer(Process):
     '''
     This class manages the queue of tweets waiting to be added to the
     SQL database
@@ -170,8 +177,9 @@ class tweet_consumer(threading.Thread):
 
     def __init__(self, queue, engine, parmdata, name=None):
         # initialize the thread
-        threading.Thread.__init__(self, name=name)
 
+        Process.__init__(self, name=name)
+        
         log.info("Starting new tweet consumer.")
  
         # this is meant to be a daemon process, exiting when the program closes
@@ -182,8 +190,7 @@ class tweet_consumer(threading.Thread):
  
         # bind this thread to the database
         log.info('Establishing database session..')
-        Session = sessionmaker(bind=engine)
-        self.session = Session()
+        self.session = get_sql_session(parmdata)
 
         # set the queue to pull tweets from
         self.queue = queue
@@ -215,7 +222,6 @@ class tweet_consumer(threading.Thread):
     def run(self):
         while True:
             status = self.queue.get()
-            self.queue.task_done()
             if any(status.lang in s for s in self.languages) or \
                any('ALL' in s.upper() for s in self.languages):
                 '''
@@ -244,7 +250,7 @@ class tweet_consumer(threading.Thread):
         '''
         elapsed_time = (dt.now() - self.last_time).total_seconds()
         if elapsed_time > self.log_interval:
-            log.info("Capturing %f tweets/second (%f/sec discarded as duplicates)." %
+            log.info("Consuming %f tweets/second (%f/sec discarded as duplicates)." %
                      (self.n_tweets/elapsed_time, self.n_dupes/elapsed_time))
             log.info("Reporting %d tweets remaining in queue." %
                      self.queue.qsize())
@@ -253,10 +259,10 @@ class tweet_consumer(threading.Thread):
             self.n_dupes = 0
 
 
-class tweet_producer(threading.Thread):
+class tweet_producer(Process):
     def __init__(self, auth, queue, parmdata, name=None):
         # initialize the thread
-        threading.Thread.__init__(self, name=name)
+        Process.__init__(self, name=name)
 
         log.info("Starting new tweet producer.")
         self.auth = auth
@@ -272,18 +278,18 @@ class tweet_producer(threading.Thread):
                 self.api = tweepy.API(self.auth)
                 
                 # set up stream listener
-                self.myListener = database_listener(self.api, self.queue)
+                self.myListener = database_listener(self.api, self.queue,
+                                                    self.parmdata['settings']['log_interval'])
                 
                 self.stream =  tweepy.streaming.Stream(self.auth,
-                                                self.myListener, timeout=60)
+                                                       self.myListener, timeout=60)
                 log.info("Streaming API connected.  Adding tweets to queue.")
                 self.stream.sample()
             except requests.packages.urllib3.exceptions.ProtocolError:
                 pass
             except Exception as e:
                 log.error(str(e))
-                self.active = False
-                raise
+                pass
  
     def close(self):
         log.info("Disconnecting Twitter stream.")
@@ -301,9 +307,11 @@ class database_listener(tweepy.StreamListener):
     Takes data received from the streaming API and places it in the
     queue to be processed by tweet_handlers
     '''
-   
+
     def on_status(self, status):
         self.queue.put(status)
+        self.n_count += 1
+        self.status_update()
         return True
  
     def on_error(self, status_code):
@@ -314,9 +322,25 @@ class database_listener(tweepy.StreamListener):
         log.info('Listener timeout.')
         return True   # To continue listening
 
-    def __init__(self, api, queue):
+    def status_update(self):
+        '''
+        Method for keeping track of the rate at which each tweet producer is
+        feeding the queue
+        '''
+        elapsed_time = (dt.now() - self.last_time).total_seconds()
+        if elapsed_time > self.log_interval:
+            log.info("Producing %f tweets/second." %
+                     (self.n_count/elapsed_time))
+            self.last_time = dt.now()
+            self.n_count = 0
+
+
+    def __init__(self, api, queue, log_interval):
         self.api = api
         self.queue = queue
+        self.n_count = 0
+        self.log_interval = log_interval
+        self.last_time = dt.now()
        
 ###########################################################
 #            SQLAlchemy Class Definitions
@@ -328,7 +352,7 @@ class Hashtag(Base):
     __tablename__ = "Hashtag"
     hashid = Column('hashid', Integer, primary_key=True)
     tweetid = Column('tweetid', BigInteger, ForeignKey("Tweet.tweetid"),
-                     unique=False)
+                     unique=False, index=True)
     tag = Column('tag', String, unique=False)
         
     def __init__(self, tweet, tag):
@@ -341,7 +365,7 @@ class Media(Base):
     __tablename__ = "Media"
     mediaid = Column('mediaid', Integer, primary_key=True)
     tweetid = Column('tweetid', BigInteger, ForeignKey("Tweet.tweetid"),
-                     unique=False)
+                     unique=False, index=True)
     blob = Column('blob', Binary, unique=False, nullable=True)
     native_filename = Column('native_filename', String, unique=False,
                              nullable=True)
@@ -376,7 +400,7 @@ class URLData(Base):
     __tablename__ = "URLData"
     urlid = Column('urlid', Integer, primary_key=True)
     tweetid = Column('tweetid', BigInteger, ForeignKey("Tweet.tweetid"),
-                     unique=False)
+                     unique=False, index=True)
     url = Column('url', String, unique=False)
     
     def __init__(self, tweet, url):
@@ -389,7 +413,7 @@ class Mention(Base):
     __tablename__ = "Mention"
     mentionid = Column('mentionid', Integer, primary_key=True)
     tweetid = Column('tweetid', BigInteger, ForeignKey("Tweet.tweetid"),
-                     unique=False)
+                     unique=False, index=True)
     source = Column('source', BigInteger, unique=False)
     target = Column('target', BigInteger, unique=False)
     
@@ -404,7 +428,7 @@ class Geotag(Base):
     __tablename__ = "Geotag"
     geoid = Column('geoid', Integer, primary_key=True)
     tweetid = Column('tweetid', BigInteger, ForeignKey("Tweet.tweetid"),
-                     unique=False)
+                     unique=False, index=True)
     latitude = Column('latitude', Float, unique=False)
     longitude = Column('longitude', Float, unique=False)
     
@@ -418,24 +442,19 @@ class Tweet(Base):
     """Tweet Data"""
     __tablename__ = "Tweet"
 
-    tweetid = Column(BigInteger, primary_key=True)
-    userid = Column('userid', BigInteger, ForeignKey("User.userid"))
+    tweetid = Column(BigInteger, primary_key=True, index=True)
+    userid = Column('userid', BigInteger, ForeignKey("User.userid"), index=True)
     text = Column('text', String(length=500), nullable=True)
     rtcount = Column('rtcount', Integer)
     fvcount = Column('fvcount', Integer)
     lang = Column('lang', String)
     date = Column('date', DateTime)
     source = Column('source', String)
-    geotags = relationship(Geotag, primaryjoin=tweetid == Geotag.tweetid,
-                           lazy="dynamic")
-    hashtags = relationship(Hashtag, primaryjoin=tweetid == Hashtag.tweetid,
-                            lazy="dynamic")
-    mentions = relationship(Mention, primaryjoin=tweetid == Mention.tweetid,
-                            lazy="dynamic")
-    urls = relationship(URLData, primaryjoin=tweetid == URLData.tweetid,
-                        lazy="dynamic")
-    media = relationship(Media, primaryjoin=tweetid == Media.tweetid,
-                         lazy="dynamic")
+    geotags = relationship(Geotag, lazy="dynamic", backref='tweet')
+    hashtags = relationship(Hashtag, lazy="dynamic", backref='tweet')
+    mentions = relationship(Mention, lazy="dynamic", backref='tweet')
+    urls = relationship(URLData, lazy="dynamic",  backref='tweet')
+    media = relationship(Media, lazy="dynamic", backref='tweet')
 
     def __init__(self, tweet):
         self.tweetid = tweet.id
@@ -456,7 +475,7 @@ class User(Base):
     """Twitter User Data"""
     __tablename__ = "User"
 
-    userid = Column(BigInteger, primary_key=True)
+    userid = Column(BigInteger, primary_key=True, index=True)
     username = Column('username', String)
     name = Column('name', String)
     location = Column('location', String, nullable=True)
@@ -469,8 +488,7 @@ class User(Base):
     geoloc = Column('geoloc', Boolean)
     lastupdate = Column('lastupdate', DateTime)
     verified = Column('verified', Boolean)
-    tweets = relationship(Tweet, primaryjoin=userid == Tweet.userid,
-                          lazy="dynamic")
+    tweets = relationship(Tweet, lazy="dynamic", backref='user')
 
     def __init__(self, author):
         self.userid = author.id
