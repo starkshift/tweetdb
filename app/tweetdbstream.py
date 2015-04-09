@@ -6,7 +6,6 @@ import argparse
 import sys
 import time
 from multiprocessing import cpu_count, Queue
-#import Queue
 
 
 def main():

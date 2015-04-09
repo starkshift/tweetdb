@@ -37,7 +37,7 @@ class DatabaseInterrogator(object):
         if stop is None:
             stop = dt.utcnow()
 
-        thisQuery = self.session.query(Geotag.latitude,Geotag.longitude,Tweet.date).\
+        thisQuery = self.session.query(Geotag.latitude, Geotag.longitude, Tweet.date).\
                     filter(Tweet.date >= start).\
                     filter(Tweet.date <= stop).\
                     filter(Geotag.tweetid == Tweet.tweetid).\

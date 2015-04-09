@@ -16,7 +16,7 @@ import logging
 import requests
 import md5
 import os
-import threading
+import re
 from multiprocessing import Process
 from yaml import load
 from datetime import datetime as dt
@@ -26,6 +26,8 @@ from sqlalchemy import Column, DateTime, Integer, String, Boolean, BigInteger, \
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship, sessionmaker
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm.exc import MultipleResultsFound, NoResultFound
+
 
 # set up the sql base
 Base = declarative_base()
@@ -116,6 +118,42 @@ def read_timeline(engine, auth, parmdata, userid=None):
     session.close()
 
 
+def tweet_words(text):
+    # make the text all lower case
+    text = text.lower()
+
+    # strip off URL data
+    text = re.sub('((www\.[^\s]+)|(https?://[^\s]+))', '', text)
+
+    # strip off mentions
+    text = re.sub('@[^\s]+', '', text)
+
+    # remove additional white spaces
+    text = re.sub('[\s]+', ' ', text)
+
+    # replace hashtags with a word
+    text = re.sub(r'#([^\s]+)', r'\1', text)
+
+    # trim
+    text = text.strip('\'"')
+
+    # split into words
+    words = text.split()
+    goodwords = []
+    for word in words:
+        word = word.strip('\'"?,.!;:')
+        # check if the word stats with an alphabet
+        val = re.search(r"^[a-zA-Z][a-zA-Z0-9]*$", word)
+
+        # keep only words of length 2 or more
+        if (val is None or len(word) < 3):
+            continue
+        else:
+            goodwords.append(word)
+
+    return goodwords
+
+
 def add_tweet(tweet, session, get_images=False, image_path=None, https=None):
     # check if we've already added this tweet
     if session.query(Tweet).filter(Tweet.tweetid == tweet.id).count() == 0:
@@ -123,7 +161,7 @@ def add_tweet(tweet, session, get_images=False, image_path=None, https=None):
         session.add(tweetobj)
       
         for tag in tweet.entities['hashtags']:
-            hashobj = Hashtag(tweet, tag)
+            hashobj = Hashtag(tweet, tag, session)
             session.merge(hashobj)
           
         for mention in tweet.entities['user_mentions']:
@@ -144,6 +182,15 @@ def add_tweet(tweet, session, get_images=False, image_path=None, https=None):
                 session.merge(mediaobj)
 
         session.commit()
+
+        # process words inside the tweet's body
+        words = tweet_words(tweet.text)
+        for word in words:
+            wordobj = TweetWord(tweet.id, word, session)
+            session.merge(wordobj)
+        
+        session.commit()
+        
 
     else:
         tweetobj = session.query(Tweet).filter(Tweet.tweetid == tweet.id).one()
@@ -334,7 +381,6 @@ class database_listener(tweepy.StreamListener):
             self.last_time = dt.now()
             self.n_count = 0
 
-
     def __init__(self, api, queue, log_interval):
         self.api = api
         self.queue = queue
@@ -353,11 +399,75 @@ class Hashtag(Base):
     hashid = Column('hashid', Integer, primary_key=True)
     tweetid = Column('tweetid', BigInteger, ForeignKey("Tweet.tweetid"),
                      unique=False, index=True)
-    tag = Column('tag', String, unique=False)
+    hashtagid = Column('hashtagid', Integer, ForeignKey("HashtagLexicon.hashtagid"),
+                       unique=False, index=True)
         
-    def __init__(self, tweet, tag):
+    def __init__(self, tweet, tag, session):
+        # check if the hashtag is already in the lexicon
+        try:
+            lexobj = session.query(HashtagLexicon).\
+                    filter(HashtagLexicon.hashtagtext == tag['text']).one()
+        except MultipleResultsFound, e:
+            raise e
+        except NoResultFound, e:
+            lexobj = HashtagLexicon(tag)
+            lexobj = session.merge(lexobj)
+            session.flush()
         self.tweetid = tweet.id
-        self.tag = tag['text']
+        self.hashtagid = lexobj.hashtagid
+
+
+class HashtagLexicon(Base):
+    """Hashtag Text"""
+    __tablename__ = "HashtagLexicon"
+    hashtagid = Column('hashtagid', Integer, unique=True, primary_key=True,
+                       index=True)
+    hashtagtext = Column('hashtagtext', String, index=True, unique=True)
+
+    def __init__(self, tag):
+        self.hashtagtext = tag['text']
+
+
+class TweetLexicon(Base):
+    """Tweet Text"""
+    __tablename__ = "TweetLexicon"
+    wordid = Column('wordid', Integer, unique=True, primary_key=True,
+                       index=True)
+    wordtext = Column('wordtext', String, index=True, unique=True)
+
+    def __init__(self, word):
+        self.wordtext = word
+
+
+class TweetWord(Base):
+    """Tweet Text"""
+    __tablename__ = "TweetWord"
+    id = Column('id', Integer, unique=True, primary_key=True)
+    tweetid = Column('tweetid', BigInteger, ForeignKey("Tweet.tweetid"),
+                     unique=False, index=True)
+    wordid = Column('wordid', Integer, index=True)
+
+    def __init__(self, tweetid, word, session):
+        jobdone = False
+        while not jobdone:
+            try:
+                wordobj = session.query(TweetLexicon).\
+                          filter(TweetLexicon.wordtext == word).one()
+            except MultipleResultsFound, e:
+                raise e
+            except NoResultFound, e:
+                try:
+                    wordobj = TweetLexicon(word)
+                    wordobj = session.merge(wordobj)
+                    session.flush()
+                except IntegrityError, e:
+                    session.rollback()
+                    pass
+                except:
+                    raise
+            jobdone = True
+        self.tweetid = tweetid
+        self.wordid = wordobj.wordid
 
 
 class Media(Base):
@@ -414,8 +524,8 @@ class Mention(Base):
     mentionid = Column('mentionid', Integer, primary_key=True)
     tweetid = Column('tweetid', BigInteger, ForeignKey("Tweet.tweetid"),
                      unique=False, index=True)
-    source = Column('source', BigInteger, unique=False)
-    target = Column('target', BigInteger, unique=False)
+    source = Column('source', BigInteger, unique=False, index=True)
+    target = Column('target', BigInteger, unique=False, index=True)
     
     def __init__(self, tweet, mention):
         self.tweetid = tweet.id
@@ -445,11 +555,12 @@ class Tweet(Base):
     tweetid = Column(BigInteger, primary_key=True, index=True)
     userid = Column('userid', BigInteger, ForeignKey("User.userid"), index=True)
     text = Column('text', String(length=500), nullable=True)
+    place = Column('place', String, index=True)
     rtcount = Column('rtcount', Integer)
     fvcount = Column('fvcount', Integer)
-    lang = Column('lang', String)
-    date = Column('date', DateTime)
-    source = Column('source', String)
+    lang = Column('lang', String, index=True)
+    date = Column('date', DateTime, index=True)
+    source = Column('source', String, index=True)
     geotags = relationship(Geotag, lazy="dynamic", backref='tweet')
     hashtags = relationship(Hashtag, lazy="dynamic", backref='tweet')
     mentions = relationship(Mention, lazy="dynamic", backref='tweet')
